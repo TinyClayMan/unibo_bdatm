@@ -13,7 +13,6 @@ import json
 import math
 import glob
 import time
-import random
 import argparse
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -23,55 +22,29 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from torchdrug import data, models, layers
 from torchdrug.layers import geometry
 
-
-# -----------------------------
-# basic utils
-# -----------------------------
-
-def set_seed(seed: int):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
-def log(msg: str):
-    print(msg, flush=True)
-
-
-def ensure_dir(path: str):
-    os.makedirs(path, exist_ok=True)
-
-
-def accession_from_path(path: str) -> str:
-    base = os.path.basename(path)
-    stem = os.path.splitext(base)[0]
-
-    # Main case: AF-A0A0S2Z5D6-F1(.pdb) -> A0A0S2Z5D6
-    m = re.match(r"AF-([A-Z0-9]+)-F\d+$", stem)
-    if m:
-        return m.group(1)
-
-    # Fallback for numeric AFDB-style names
-    m = re.match(r"AF-(\d+)$", stem)
-    if m:
-        return m.group(1)
-
-    return stem
-
-
-def find_all_pdbs(root: str) -> List[str]:
-    return sorted(glob.glob(os.path.join(root, "**", "*.pdb"), recursive=True))
-
+from gearnet_common import (
+    set_seed,
+    log,
+    ensure_dir,
+    accession_from_path,
+    find_all_pdbs,
+    LabelArtifacts,
+    build_labels,
+    load_taxonomy_whitelist,
+    build_samples,
+    add_multihot_columns,
+    multilabel_iterative_split_fallback,
+    make_split,
+    PDBDataset,
+    make_collate_fn,
+    safe_iter_loader,
+)
 
 # -----------------------------
 # metrics
@@ -128,226 +101,7 @@ def fmax_micro_macro(y_true: np.ndarray, y_score: np.ndarray, thresholds=None):
     }
 
 
-def multilabel_iterative_split_fallback(df: pd.DataFrame, seed: int = 42):
-    work = df.copy()
-    work = work.sample(frac=1.0, random_state=seed).reset_index(drop=True)
-    work["label_count"] = work["label_indices"].map(len)
-    work = work.sort_values(["label_count", "accession"], ascending=[False, True]).reset_index(drop=True)
 
-    n = len(work)
-    n_test = max(1, int(round(0.10 * n)))
-    n_val = max(1, int(round(0.10 * n)))
-
-    split = np.array(["train"] * n, dtype=object)
-    order = np.arange(n)
-    test_idx = order[::10][:n_test]
-    val_candidates = [i for i in order[1::10] if i not in set(test_idx)]
-    val_idx = np.array(val_candidates[:n_val], dtype=int)
-    split[test_idx] = "test"
-    split[val_idx] = "valid"
-    work["split"] = split
-    return work
-
-
-# -----------------------------
-# labels and sample building
-# -----------------------------
-@dataclass
-class LabelArtifacts:
-    entry_to_label_idxs: Dict[str, List[int]]
-    idx_to_term: List[str]
-    idx_to_aspect: List[str]
-    term_to_idx: Dict[str, int]
-    aspect_masks: Dict[str, np.ndarray]
-
-
-def build_labels(train_terms_path: str, num_labels: int) -> LabelArtifacts:
-    train_terms = pd.read_csv(train_terms_path, sep="\t")
-    required = {"EntryID", "term", "aspect"}
-    missing = required - set(train_terms.columns)
-    if missing:
-        raise ValueError(f"Missing columns in train_terms.tsv: {missing}")
-
-    train_terms = train_terms.copy()
-    train_terms["EntryID"] = train_terms["EntryID"].astype(str)
-
-    top = train_terms["term"].value_counts().head(num_labels)
-    idx_to_term = list(top.index)
-    term_to_idx = {t: i for i, t in enumerate(idx_to_term)}
-
-    top_df = train_terms[train_terms["term"].isin(term_to_idx)].copy()
-    top_df["term_idx"] = top_df["term"].map(term_to_idx)
-
-    term_aspect = (
-        top_df[["term", "aspect"]]
-        .drop_duplicates()
-        .groupby("term")["aspect"]
-        .first()
-        .to_dict()
-    )
-    idx_to_aspect = [str(term_aspect[t]) for t in idx_to_term]
-
-    entry_to_label_idxs = (
-        top_df.groupby("EntryID")["term_idx"]
-        .apply(lambda s: sorted(set(int(x) for x in s.tolist())))
-        .to_dict()
-    )
-
-    aspect_masks = {}
-    for aspect in ["BPO", "MFO", "CCO", "BP", "MF", "CC"]:
-        mask = np.array([a == aspect for a in idx_to_aspect], dtype=bool)
-        if mask.any():
-            aspect_masks[aspect] = mask
-
-    return LabelArtifacts(
-        entry_to_label_idxs=entry_to_label_idxs,
-        idx_to_term=idx_to_term,
-        idx_to_aspect=idx_to_aspect,
-        term_to_idx=term_to_idx,
-        aspect_masks=aspect_masks,
-    )
-
-
-def load_taxonomy_whitelist(path: Optional[str]):
-    if not path or not os.path.exists(path):
-        return None, None
-    df = pd.read_csv(path, sep="\t")
-    whitelist = None
-    if "EntryID" in df.columns:
-        whitelist = set(df["EntryID"].astype(str).tolist())
-    return df, whitelist
-
-
-def build_samples(
-    pdb_root: str,
-    labels: LabelArtifacts,
-    taxonomy_path: Optional[str] = None,
-    require_label: bool = True,
-):
-    taxonomy_df, whitelist = load_taxonomy_whitelist(taxonomy_path)
-    tax_cols = [] if taxonomy_df is None else list(taxonomy_df.columns)
-    tax_map = {}
-    if taxonomy_df is not None and "EntryID" in taxonomy_df.columns:
-        taxonomy_df = taxonomy_df.copy()
-        taxonomy_df["EntryID"] = taxonomy_df["EntryID"].astype(str)
-        tax_map = taxonomy_df.set_index("EntryID").to_dict(orient="index")
-
-    all_pdbs = find_all_pdbs(pdb_root)
-    log(f"Discovered {len(all_pdbs)} pdb files under {pdb_root}")
-
-    rows = []
-    matched_labels = 0
-    matched_whitelist = 0
-    both = 0
-
-    for path in tqdm(all_pdbs, desc="building sample index"):
-        accession = accession_from_path(path)
-        in_labels = accession in labels.entry_to_label_idxs
-        in_whitelist = whitelist is None or accession in whitelist
-
-        if in_labels:
-            matched_labels += 1
-        if in_whitelist:
-            matched_whitelist += 1
-        if in_labels and in_whitelist:
-            both += 1
-
-        if whitelist is not None and accession not in whitelist:
-            continue
-        label_idxs = labels.entry_to_label_idxs.get(accession, [])
-        if require_label and not label_idxs:
-            continue
-
-        row = {
-            "accession": accession,
-            "pdb_path": path,
-            "label_indices": label_idxs,
-        }
-        if accession in tax_map:
-            row.update(tax_map[accession])
-        rows.append(row)
-
-    log(f"label-matched pdbs: {matched_labels}")
-    log(f"whitelist-matched pdbs: {matched_whitelist}")
-    log(f"usable labeled pdbs: {both}")
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        raise RuntimeError("No labeled PDB samples found")
-    for c in tax_cols:
-        if c not in df.columns:
-            df[c] = None
-    return df
-
-
-def add_multihot_columns(df: pd.DataFrame, num_labels: int):
-    y = np.zeros((len(df), num_labels), dtype=np.float32)
-    for i, idxs in enumerate(df["label_indices"].tolist()):
-        y[i, idxs] = 1.0
-    df = df.copy()
-    df["num_pos"] = y.sum(axis=1).astype(int)
-    return df, y
-
-
-def make_split(df: pd.DataFrame, y: np.ndarray, seed: int = 42):
-    work = df.copy().reset_index(drop=True)
-    try:
-        from iterstrat.ml_stratifiers import MultilabelStratifiedShuffleSplit
-        msss1 = MultilabelStratifiedShuffleSplit(n_splits=1, test_size=0.20, random_state=seed)
-        train_idx, temp_idx = next(msss1.split(np.zeros(len(work)), y))
-        train_df = work.iloc[train_idx].copy().reset_index(drop=True)
-        temp_df = work.iloc[temp_idx].copy().reset_index(drop=True)
-        y_temp = y[temp_idx]
-        msss2 = MultilabelStratifiedShuffleSplit(n_splits=1, test_size=0.50, random_state=seed + 1)
-        valid_rel, test_rel = next(msss2.split(np.zeros(len(temp_df)), y_temp))
-        valid_df = temp_df.iloc[valid_rel].copy()
-        test_df = temp_df.iloc[test_rel].copy()
-        train_df["split"] = "train"
-        valid_df["split"] = "valid"
-        test_df["split"] = "test"
-        out = pd.concat([train_df, valid_df, test_df], ignore_index=True)
-        return out
-    except Exception:
-        log("iterative stratification unavailable; using fallback split")
-        return multilabel_iterative_split_fallback(work, seed=seed)
-
-
-# -----------------------------
-# dataset
-# -----------------------------
-class CustomGODataset(Dataset):
-    def __init__(self, df: pd.DataFrame, num_labels: int, kwargs=None):
-        self.df = df.reset_index(drop=True).copy()
-        self.num_labels = num_labels
-        self.kwargs = kwargs or {}
-        self.transform = None
-        self.pdb_files = self.df["pdb_path"].tolist()
-        self.accessions = self.df["accession"].astype(str).tolist()
-        self.label_indices = self.df["label_indices"].tolist()
-        self.targets = np.zeros((len(self.df), num_labels), dtype=np.float32)
-        for i, idxs in enumerate(self.label_indices):
-            self.targets[i, idxs] = 1.0
-
-    def __len__(self):
-        return len(self.df)
-
-    def get_item(self, index):
-        protein = data.Protein.from_pdb(self.pdb_files[index], **self.kwargs)
-        if hasattr(protein, "residue_feature") and protein.residue_feature is not None:
-            with protein.residue():
-                protein.residue_feature = protein.residue_feature.to_dense()
-        item = {
-            "graph": protein,
-            "target": torch.from_numpy(self.targets[index]).float(),
-            "accession": self.accessions[index],
-            "pdb_file": self.pdb_files[index],
-        }
-        if self.transform:
-            item = self.transform(item)
-        return item
-
-    def __getitem__(self, index):
-        return self.get_item(index)
 
 
 # -----------------------------
@@ -419,56 +173,6 @@ class GearNetGOFinetuner(nn.Module):
 
 
 # -----------------------------
-# safe batch collation
-# -----------------------------
-def make_collate_fn():
-    def collate(batch):
-        batch = [x for x in batch if x is not None]
-        if len(batch) == 0:
-            return None
-        proteins = [x["graph"] for x in batch]
-        targets = torch.stack([x["target"] for x in batch], dim=0)
-        accessions = [x["accession"] for x in batch]
-        pdb_files = [x["pdb_file"] for x in batch]
-        packed = data.Protein.pack(proteins)
-        packed.view = "residue"
-        return {
-            "graph": packed,
-            "target": targets,
-            "accession": accessions,
-            "pdb_file": pdb_files,
-        }
-    return collate
-
-
-# -----------------------------
-# robust loader iteration
-# -----------------------------
-def safe_iter_loader(loader, desc: str, dataset_name: str, max_skip_logs: int = 20):
-    skipped = 0
-    it = iter(loader)
-    pbar = tqdm(total=len(loader), desc=desc, leave=False)
-    while True:
-        try:
-            batch = next(it)
-            pbar.update(1)
-            if batch is None:
-                skipped += 1
-                if skipped <= max_skip_logs:
-                    log(f"[{dataset_name}] skipped empty batch after filtering bad samples")
-                continue
-            yield batch
-        except StopIteration:
-            break
-        except Exception as e:
-            pbar.update(1)
-            skipped += 1
-            if skipped <= max_skip_logs:
-                log(f"[{dataset_name}] skipped failing batch: {repr(e)}")
-            continue
-    pbar.close()
-    if skipped:
-        log(f"[{dataset_name}] total skipped batches: {skipped}")
 
 
 # -----------------------------
@@ -611,9 +315,9 @@ def main():
         "bond_feature": "default",
         "residue_feature": "default",
     }
-    train_ds = CustomGODataset(df[df["split"] == "train"], args.num_labels, kwargs=kwargs)
-    valid_ds = CustomGODataset(df[df["split"] == "valid"], args.num_labels, kwargs=kwargs)
-    test_ds = CustomGODataset(df[df["split"] == "test"], args.num_labels, kwargs=kwargs)
+    train_ds = PDBDataset(df[df["split"] == "train"], args.num_labels, kwargs=kwargs, use_target_col=True)
+    valid_ds = PDBDataset(df[df["split"] == "valid"], args.num_labels, kwargs=kwargs, use_target_col=True)
+    test_ds = PDBDataset(df[df["split"] == "test"], args.num_labels, kwargs=kwargs, use_target_col=True)
 
     collate_fn = make_collate_fn()
     train_loader = DataLoader(

@@ -14,6 +14,9 @@ from cafa import (
     obo_parser,
     ia_parser,
     set_seed,
+    normalize_id,
+    build_x_for_ids,
+    align_rows_to_found_ids,
 )
 
 # -------------------------
@@ -41,46 +44,6 @@ SEED = 42
 TAU_ARR = np.arange(0.01, 1.00, 0.01, dtype=np.float32)
 
 
-def normalize_id(x):
-    return str(x).strip()
-
-
-def build_x_for_ids(target_ids, embed_ids, embeds, split_name):
-    id_to_embed_idx = {normalize_id(pid): i for i, pid in enumerate(embed_ids)}
-
-    found_idx = []
-    found_ids = []
-    missing_ids = []
-
-    for acc in map(normalize_id, target_ids):
-        j = id_to_embed_idx.get(acc)
-        if j is None:
-            missing_ids.append(acc)
-        else:
-            found_idx.append(j)
-            found_ids.append(acc)
-
-    if len(found_idx) == 0:
-        raise ValueError(f"No embeddings found for split={split_name}")
-
-    x = embeds[np.asarray(found_idx, dtype=np.int64)]
-
-    print(
-        f"{split_name}: matched {len(found_ids)}/{len(target_ids)} ids "
-        f"(missing={len(missing_ids)})"
-    )
-    if missing_ids:
-        print(f"{split_name}: first 10 missing ids: {missing_ids[:10]}")
-
-    return x, found_ids, missing_ids
-
-
-def align_y_to_found_ids(all_target_ids, y_target, found_ids):
-    pos = {normalize_id(acc): i for i, acc in enumerate(all_target_ids)}
-    row_idx = [pos[normalize_id(acc)] for acc in found_ids]
-    return y_target[np.asarray(row_idx, dtype=np.int64)]
-
-
 # -------------------------
 # build dataset from GearNet splits + T5 embeddings
 # -------------------------
@@ -104,9 +67,9 @@ x_valid, valid_ids, missing_valid = build_x_for_ids(valid_ids_all, embed_ids, em
 x_test,  test_ids,  missing_test  = build_x_for_ids(test_ids_all,  embed_ids, embeds, "test")
 
 # Align labels to the matched IDs
-y_train = align_y_to_found_ids(train_ids_all, yg_train, train_ids)
-y_valid = align_y_to_found_ids(valid_ids_all, yg_valid, valid_ids)
-y_test  = align_y_to_found_ids(test_ids_all,  yg_test,  test_ids)
+y_train = align_rows_to_found_ids(train_ids_all, yg_train, train_ids)
+y_valid = align_rows_to_found_ids(valid_ids_all, yg_valid, valid_ids)
+y_test  = align_rows_to_found_ids(test_ids_all,  yg_test,  test_ids)
 
 if y_train.shape[1] != y_valid.shape[1] or y_train.shape[1] != y_test.shape[1]:
     raise ValueError("Label dimension mismatch across train/valid/test")

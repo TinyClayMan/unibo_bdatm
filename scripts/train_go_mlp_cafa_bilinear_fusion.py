@@ -15,53 +15,10 @@ from cafa import (
     obo_parser,
     ia_parser,
     set_seed,
+    normalize_id,
+    build_x_for_ids,
+    align_rows_to_found_ids,
 )
-
-# -------------------------------------------------------
-# helpers
-# -------------------------------------------------------
-def normalize_id(x):
-    return str(x).strip()
-
-def build_x_for_ids(target_ids, embed_ids, embeds, split_name, strict=False):
-    id_to_embed_idx = {normalize_id(pid): i for i, pid in enumerate(embed_ids)}
-
-    found_idx = []
-    found_ids = []
-    missing_ids = []
-
-    for acc in map(normalize_id, target_ids):
-        j = id_to_embed_idx.get(acc)
-        if j is None:
-            missing_ids.append(acc)
-        else:
-            found_idx.append(j)
-            found_ids.append(acc)
-
-    if len(found_idx) == 0:
-        raise ValueError(f"No embeddings found for split={split_name}")
-
-    if strict and missing_ids:
-        raise ValueError(
-            f"{split_name}: missing {len(missing_ids)} embeddings; first 10: {missing_ids[:10]}"
-        )
-
-    x = embeds[np.asarray(found_idx, dtype=np.int64)]
-    print(
-        f"{split_name}: matched {len(found_ids)}/{len(target_ids)} ids "
-        f"(missing={len(missing_ids)})"
-    )
-    if missing_ids:
-        print(f"{split_name}: first 10 missing ids: {missing_ids[:10]}")
-
-    return x.astype(np.float32), found_ids, missing_ids
-
-
-def align_rows_to_found_ids(all_target_ids, arr_target, found_ids):
-    pos = {normalize_id(acc): i for i, acc in enumerate(all_target_ids)}
-    row_idx = [pos[normalize_id(acc)] for acc in found_ids]
-    return arr_target[np.asarray(row_idx, dtype=np.int64)]
-
 
 # -------------------------------------------------------
 # model

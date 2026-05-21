@@ -350,3 +350,123 @@ class CafaApproxCallback(tf.keras.callbacks.Callback):
         print(f"\nEpoch {epoch + 1}: CAFA approx Fmax={mean_f:.5f} WFmax={mean_wf:.5f}")
         if len(df_ns):
             print(df_ns.to_string(index=False))
+
+
+# -------------------------
+# alignment helpers
+# -------------------------
+def normalize_id(x):
+    return str(x).strip()
+
+
+def build_x_for_ids(target_ids, embed_ids, embeds, split_name, strict=False):
+    id_to_embed_idx = {normalize_id(pid): i for i, pid in enumerate(embed_ids)}
+
+    found_idx = []
+    found_ids = []
+    missing_ids = []
+
+    for acc in map(normalize_id, target_ids):
+        j = id_to_embed_idx.get(acc)
+        if j is None:
+            missing_ids.append(acc)
+        else:
+            found_idx.append(j)
+            found_ids.append(acc)
+
+    if len(found_idx) == 0:
+        raise ValueError(f"No embeddings found for split={split_name}")
+
+    if strict and missing_ids:
+        raise ValueError(
+            f"{split_name}: missing {len(missing_ids)} embeddings; first 10: {missing_ids[:10]}"
+        )
+
+    x = embeds[np.asarray(found_idx, dtype=np.int64)]
+    print(
+        f"{split_name}: matched {len(found_ids)}/{len(target_ids)} ids "
+        f"(missing={len(missing_ids)})"
+    )
+    if missing_ids:
+        print(f"{split_name}: first 10 missing ids: {missing_ids[:10]}")
+
+    return x.astype(np.float32), found_ids, missing_ids
+
+
+def align_rows_to_found_ids(all_target_ids, arr_target, found_ids):
+    pos = {normalize_id(acc): i for i, acc in enumerate(all_target_ids)}
+    row_idx = [pos[normalize_id(acc)] for acc in found_ids]
+    return arr_target[np.asarray(row_idx, dtype=np.int64)]
+
+
+# -------------------------
+# model helpers
+# -------------------------
+def residual_block(x, dim, dropout=0.12, l2=1e-5, name_prefix="res"):
+    shortcut = x
+
+    y = tf.keras.layers.LayerNormalization(name=f"{name_prefix}_ln1")(x)
+    y = tf.keras.layers.Dense(
+        dim,
+        use_bias=True,
+        activation=None,
+        kernel_initializer="he_normal",
+        kernel_regularizer=tf.keras.regularizers.l2(l2),
+        name=f"{name_prefix}_dense1",
+    )(y)
+    y = tf.keras.layers.Activation("gelu", name=f"{name_prefix}_gelu1")(y)
+    y = tf.keras.layers.Dropout(dropout, name=f"{name_prefix}_drop1")(y)
+
+    y = tf.keras.layers.Dense(
+        dim,
+        use_bias=True,
+        activation=None,
+        kernel_initializer="he_normal",
+        kernel_regularizer=tf.keras.regularizers.l2(l2),
+        name=f"{name_prefix}_dense2",
+    )(y)
+    y = tf.keras.layers.Dropout(dropout, name=f"{name_prefix}_drop2")(y)
+
+    x = tf.keras.layers.Add(name=f"{name_prefix}_add")([shortcut, y])
+    return x
+
+
+def build_model(input_dim, num_labels, width=512, bottleneck=256, noise_std=0.01, l2=1e-5):
+    inp = tf.keras.Input(shape=(input_dim,), name="embeddings")
+
+    x = tf.keras.layers.LayerNormalization(name="input_ln")(inp)
+    x = tf.keras.layers.GaussianNoise(noise_std, name="input_noise")(x)
+
+    x = tf.keras.layers.Dense(
+        width,
+        use_bias=True,
+        activation=None,
+        kernel_initializer="he_normal",
+        kernel_regularizer=tf.keras.regularizers.l2(l2),
+        name="stem_dense",
+    )(x)
+    x = tf.keras.layers.Activation("gelu", name="stem_gelu")(x)
+    x = tf.keras.layers.Dropout(0.10, name="stem_drop")(x)
+
+    x = residual_block(x, width, dropout=0.12, l2=l2, name_prefix="res1")
+    x = residual_block(x, width, dropout=0.12, l2=l2, name_prefix="res2")
+
+    x = tf.keras.layers.LayerNormalization(name="head_ln")(x)
+    x = tf.keras.layers.Dense(
+        bottleneck,
+        use_bias=True,
+        activation=None,
+        kernel_initializer="he_normal",
+        kernel_regularizer=tf.keras.regularizers.l2(l2),
+        name="head_dense",
+    )(x)
+    x = tf.keras.layers.Activation("gelu", name="head_gelu")(x)
+    x = tf.keras.layers.Dropout(0.15, name="head_drop")(x)
+
+    out = tf.keras.layers.Dense(
+        num_labels,
+        activation="sigmoid",
+        name="logits",
+    )(x)
+
+    return tf.keras.Model(inp, out, name="go_residual_mlp")

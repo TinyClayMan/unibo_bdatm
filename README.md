@@ -96,7 +96,7 @@ Called from the notebook via:
 5. In GGN_GO notebook, set `RUNTIME = "colab"` in the configuration cell, then run all cells in order.
 
 #### GCS credentials (Colab)
-The notebooks authenticate against the GCS bucket using a service account key. Replace the placeholder `gcs_key.json` content in GGN_GO notebook (Section 3, `%%writefile /content/gcs_key.json`) with your own service account credentials, or set `USE_GCS = False` and supply the data files manually.
+The notebooks authenticate against the GCS bucket using a service account key. Store your own service account credentials in the `gcs_key.json` in the root folder, or set `USE_GCS = False` and supply the data files manually.
 
 #### Without GCS access
 Download the required files from the [CAFA-5 Kaggle competition](https://www.kaggle.com/competitions/cafa-5-protein-function-prediction) and place them in the `cafa_data/` directory:

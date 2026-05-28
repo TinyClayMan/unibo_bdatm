@@ -1,3 +1,4 @@
+
 import os
 import json
 import random
@@ -21,6 +22,7 @@ from cafa import (
     set_seed,
 )
 
+
 TASKS = ["bp", "mf", "cc"]
 
 TASK_ASPECT = {
@@ -34,6 +36,7 @@ TOPK = {
     "mf": 450,
     "cc": 300,
 }
+
 
 # ============================================================
 # Basic

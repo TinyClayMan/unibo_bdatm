@@ -1,22 +1,40 @@
-import os
-import re
+"""
+Download the best experimental PDB structure for each accession in a
+previously-generated valid / test split.
+
+For each accession we:
+    1. Hit the UniProt REST API and pull out its PDB cross-references.
+    2. Filter by resolution (X-ray, cryo-EM) and optionally NMR.
+    3. Pick one hit using method preference, resolution, and chain coverage.
+    4. Download the chosen structure from RCSB (PDB, then CIF as fallback).
+
+Outputs (per split):
+    <split>/structures/<PDB_ID>.pdb               raw downloads
+    <split>/<split>_experimental_structures.csv   full manifest
+    <split>/<split>_experimental_structures.json  same data as JSON
+    summary.json                                  totals + run params
+
+Reads the accessions from one of our `<split>_embeddings.pt` files produced by
+the unified_embedding_extractor (only `accessions` is needed here).
+"""
+
+import argparse
 import csv
 import json
+import os
+import re
 import time
-import math
-import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
-
-from cafa import load_split_pt
-
+import torch
 
 UNIPROT_JSON_URL = "https://rest.uniprot.org/uniprotkb/{accession}.json"
 RCSB_PDB_URL = "https://files.rcsb.org/download/{pdb_id}.pdb"
 RCSB_CIF_URL = "https://files.rcsb.org/download/{pdb_id}.cif"
 
 
+# ---------- accession + UniProt helpers ----------
 def normalize_accession(x):
     return str(x).strip()
 
@@ -26,6 +44,13 @@ def canonical_uniprot_accession(acc):
     return acc.split("-")[0]
 
 
+def load_split_ids(path):
+    """Read the accessions list from a <split>_embeddings.pt file."""
+    obj = torch.load(path, map_location="cpu")
+    return [str(a) for a in obj["accessions"]]
+
+
+# ---------- parsing UniProt JSON ----------
 def extract_resolution_float(text):
     if text is None:
         return None
@@ -43,11 +68,10 @@ def extract_resolution_float(text):
 
 def extract_coverage_len(chains_text):
     """
-    Example values:
+    Sum interval lengths in fields like:
       "A=1-276"
       "A/C/E/G=1-26, B/D/F/H=27-149"
       "A=12-214, B=10-215"
-    We just sum all interval lengths we can parse.
     """
     if not chains_text:
         return 0
@@ -92,6 +116,7 @@ def parse_pdb_crossrefs_from_uniprot_json(payload):
     return out
 
 
+# ---------- ranking ----------
 def method_rank(method):
     if not method:
         return 999
@@ -129,7 +154,7 @@ def choose_best_hit(hits, max_xray_resolution, max_em_resolution, allow_nmr):
     if not accepted:
         return None
 
-    # Prefer method class, then lower resolution, then larger mapped coverage
+    # Prefer method class, then lower resolution, then larger mapped coverage.
     accepted = sorted(
         accepted,
         key=lambda h: (
@@ -142,6 +167,7 @@ def choose_best_hit(hits, max_xray_resolution, max_em_resolution, allow_nmr):
     return accepted[0]
 
 
+# ---------- HTTP ----------
 def make_session():
     s = requests.Session()
     s.headers.update({"User-Agent": "experimental-pdb-downloader/1.0"})
@@ -175,7 +201,6 @@ def download_structure_file(session, pdb_id, out_dir, prefer_format="pdb", timeo
     pdb_id = str(pdb_id).upper()
     os.makedirs(out_dir, exist_ok=True)
 
-    candidates = []
     if prefer_format == "pdb":
         candidates = [("pdb", RCSB_PDB_URL.format(pdb_id=pdb_id)),
                       ("cif", RCSB_CIF_URL.format(pdb_id=pdb_id))]
@@ -202,6 +227,7 @@ def download_structure_file(session, pdb_id, out_dir, prefer_format="pdb", timeo
     return None, None, None
 
 
+# ---------- per-accession pipeline ----------
 def process_accession(
     accession,
     split_name,
@@ -287,6 +313,7 @@ def process_accession(
     return result
 
 
+# ---------- manifest IO ----------
 def save_manifest(rows, out_csv, out_json):
     fieldnames = [
         "split",
@@ -326,6 +353,7 @@ def dedupe_keep_order(ids):
     return out
 
 
+# ---------- main ----------
 def main():
     parser = argparse.ArgumentParser()
 
@@ -349,11 +377,8 @@ def main():
     valid_pt = args.valid_pt or os.path.join(args.split_embed_dir, "valid_embeddings.pt")
     test_pt = args.test_pt or os.path.join(args.split_embed_dir, "test_embeddings.pt")
 
-    _, _, valid_ids = load_split_pt(valid_pt)
-    _, _, test_ids = load_split_pt(test_pt)
-
-    valid_ids = dedupe_keep_order(valid_ids)
-    test_ids = dedupe_keep_order(test_ids)
+    valid_ids = dedupe_keep_order(load_split_ids(valid_pt))
+    test_ids = dedupe_keep_order(load_split_ids(test_pt))
 
     print(f"valid ids: {len(valid_ids)}")
     print(f"test  ids: {len(test_ids)}")

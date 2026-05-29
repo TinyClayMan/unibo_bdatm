@@ -4,9 +4,8 @@
 # Run with:  bash setup_env.sh
 #
 # Notes:
-#   * No Jupyter "!" magics. Plain shell only.
-#   * Assumes you are root (Colab is). If not, prefix apt-get with sudo.
-#   * Assumes /content exists and is writable (Colab convention).
+#   Assumes you are root (Colab is). If not, prefix apt-get with sudo.
+#   Assumes /content exists and is writable (Colab convention).
 
 set -euxo pipefail
 
@@ -24,10 +23,8 @@ mkdir -p "${WORKDIR}" "${WHEEL_DIR}" "${MAMBA_BIN_DIR}"
 cd "${WORKDIR}"
 
 # ------------------------------------------------------------------
-# 1. System-pip preliminaries (these live in the host Python, NOT the
-#    micromamba env. Only keep what the host actually needs, e.g.
-#    gsutil-adjacent stuff. If you don't need any of these in the host
-#    Python, delete this whole block.)
+# 1. System-pip preliminaries, these belong to the host Python, but not the
+#    micromamba env. We only keep what the host actually needs.
 # ------------------------------------------------------------------
 python3 -m pip install -q -U crcmod
 python3 -m pip install -q mdtraj webdataset
@@ -192,7 +189,7 @@ export PATH="${HOME}/.cargo/bin:${PATH}"
 ${PIP} install --no-cache-dir "tokenizers==0.10.3" "transformers==4.14.1"
 
 # ------------------------------------------------------------------
-# 12. Clone ESM-GearNet (idempotent)
+# 12. Clone ESM-GearNet
 # ------------------------------------------------------------------
 if [ ! -d "${WORKDIR}/ESM-GearNet" ]; then
   git clone https://github.com/DeepGraphLearning/ESM-GearNet.git "${WORKDIR}/ESM-GearNet"

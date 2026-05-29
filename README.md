@@ -8,12 +8,18 @@ This repository contains notebooks and scripts for predicting protein Gene Ontol
 
 ```
 .
-├── README.md
+├── 00_Download_AlphaDB_PDBs_for_CAFA_v5.ipynb            # Step 0 - download AlphaFold PDBs for CAFA-5
+├── 01_Extract_Embeddings_GearNet_ESM_GearNet.ipynb      # Step 1 - GearNet & ESM-GearNet embeddings (+ experimental PDBs)
+├── 02_Extract_Embeddings_GGN_GO.ipynb                   # Step 2 - GGN-GO embeddings (inference-only, mini split)
+├── 03_Training_of_all_our_models_GGN_GO_CAFA5_v3.ipynb  # Step 3 - train all heads, evaluate, structure-swap, baseline
 ├── scripts/
-│   └── setup_env.sh                          # One-shot environment bootstrap (micromamba + PyTorch + TorchDrug)
-├── v7_CAFA_GNN_AlphaFold_Big_Data_Project     # Notebook 1 - data pipeline, GearNet & ESM-GearNet embeddings, MLP baselines
-│   .ipynb
-└── GGN_GO_CAFA5_v3.ipynb                     # Notebook 2 - GGN-GO graph network, feature generation, fine-tuning
+│   ├── setup_env.sh                                     # Environment bootstrap (micromamba + PyTorch + TorchDrug)
+│   ├── run_embed_pipeline.py                            # Entry point -> unified_embedding_extractor.cli
+│   ├── download_best_experimental_pdbs.py               # UniProt -> RCSB experimental-PDB selector / downloader
+│   ├── unified_embedding_extractor/                     # GearNet / ESM-GearNet embedding package (notebook 01)
+│   └── unified_cafa_model_trainer/                      # CAFA trainer + evaluator (notebook 03)
+├── README.md
+└── README_new.md
 ```
 
 ---
@@ -34,37 +40,27 @@ AlphaFold PDB structures
         └─► DSSP secondary structure  ──┘
 ```
 
-### Notebook 1 - `v7_CAFA_GNN_AlphaFold_Big_Data_Project.ipynb`
+### Notebook `00` - `00_Download_AlphaDB_PDBs_for_CAFA_v5.ipynb`
 
-This notebook handles **data ingestion, structural processing, embedding extraction, MLP training, and GCS data management**. Key steps:
+Downloads AlphaFold-DB PDB structures for the ~142k UniProt accessions listed in CAFA-5 `train_taxonomy.tsv`, organises them into shards, and uploads the shards to the GCS bucket (`gs://protein_shards/`). Each shard's output is kept in the notebook - it is not necessary to rerun to be able to launch subsequent steps.
 
-1. **GCS data download** - pulls CAFA-5 annotation files (`train_terms.tsv`, `train_taxonomy.tsv`), GO ontology (`go-basic.obo`, `IA.txt`), and AlphaFold PDB shards from a GCS bucket.
-2. **Shard processing** - extracts per-protein `.pdb` files from `.tar` shards, organises them into an evaluation pack (`ggngo_eval_pack.tar`) with defined train / validation / test splits.
-3. **GearNet embedding extraction** - runs `gearnet_go_finetune_pipeline.py` under a `micromamba`-managed `torchdrug38` environment to produce per-protein graph embeddings (saved as `.pt` split files).
-4. **ESM-GearNet embedding extraction** - runs `esm_gearnet_unified_embedding_pipeline.py` with the `mc_esm_gearnet.pth` checkpoint; handles both AlphaFold and experimental PDB structures.
-5. **MLP baselines** - trains multi-label MLP heads on T5-ProtTrans, GearNet, and ESM-GearNet embeddings via `train_go_mlp_cafa_from_saved_splits*.py`; evaluates with CAFA Fmax/WFmax.
-6. **Bilinear fusion** - trains a cross-attention bilinear fusion of GearNet + T5 embeddings.
-7. **Structure-swap experiment** - compares model performance on AlphaFold vs experimental PDB structures for the same proteins.
-8. **GCS sync** - uploads trained model checkpoints and result tarballs back to the GCS bucket.
+### Notebook `01` - `01_Extract_Embeddings_GearNet_ESM_GearNet.ipynb`
 
-### Notebook 2 - `GGN_GO_CAFA5_v3.ipynb`
+Extracts per-protein embeddings with two **frozen pretrained encoders** - GearNet (`mc_gearnet_edge.pth`) and ESM-GearNet (`mc_esm_gearnet.pth`) - by running our `scripts/unified_embedding_extractor/` package (via `scripts/run_embed_pipeline.py`) over the PDB shards. It then downloads matching wet-lab PDB structures for the valid / test proteins (`scripts/download_best_experimental_pdbs.py`: UniProt -> RCSB, resolution-filtered) and re-embeds them with the same encoders for the structure-swap experiment. Outputs are `<split>_embeddings.pt` files per encoder, saved to GCS.
 
-This notebook implements the full **GGN-GO graph neural network pipeline** for structure-aware protein function prediction. Key steps:
+### Notebook `02` - `02_Extract_Embeddings_GGN_GO.ipynb`
 
-1. **Configuration** - a single cell sets the runtime (`colab` / `local`), dataset mode (`demo` / `full`), task (`bp` / `mf` / `cc`), and hyperparameters.
-2. **GGN-GO repository setup** - clones [MiJia-ID/GGN-GO](https://github.com/MiJia-ID/GGN-GO) and installs PyG, `fair-esm`, `transformers`, `biopython`, and `obonet`.
-3. **Data acquisition** - downloads annotation files from GCS or falls back to Kaggle / OBO Foundry instructions.
-4. **Feature generation** - per-residue features for each protein:
-   - **Backbone coordinates** (N, CA, C, O) from AlphaFold PDBs via BioPython
-   - **ProtTrans embeddings** (1024-d) from `Rostlab/prot_t5_xl_half_uniref50-enc`
-   - **ESM2 embeddings** (1280-d) from `esm2_t33_650M_UR50D`
-   - **DSSP features** (14-d: sin/cos φ/ψ, relative ASA, 9-class SS one-hot) via `mkdssp` installed through `micromamba`
-5. **Graph dataset** - a `CAFA5ProteinGraphDataset` builds k-NN residue graphs (k=30) with scalar node features (2324-d total) and vector node/edge features for GVP layers.
-6. **GGN-GO model** - loads the pretrained `model_bp/mf/cc.pt` checkpoint; replaces the final readout head for the CAFA-5 label vocabulary; optionally freezes the encoder.
-7. **Zero-shot evaluation** - runs the unmodified pretrained GGN-GO checkpoint on the CAFA-5 validation split for BP, MF, and CC separately.
-8. **Fine-tuning** - trains with `BCELoss` + optional NT-Xent contrastive loss, with early stopping on validation loss.
-9. **Cross-embedding MLP training** (`train_mlp_clean_torch.py`) - trains lightweight MLP or GGN-style heads on top of T5, GearNet (`.pt`), or GGN-GO (`.npz`) embeddings; supports `same` split (GGN-GO mini-split) and `all` split (full CAFA-5 train/val); evaluates with full CAFA Fmax/WFmax.
-10. **Naive frequency baseline** (`eval_naive_freq_cafa_small.py`) - computes a term-frequency baseline for comparison.
+Does **GGN-GO inference** on the mini split. Clones [MiJia-ID/GGN-GO](https://github.com/MiJia-ID/GGN-GO), builds per-residue multi-modal features (ProtTrans T5 + ESM-2 + DSSP + backbone coordinates), loads the authors' pretrained `model_bp/mf/cc.pt`, and extracts the 512-d pooled protein embedding before the task head. There is no GGN-GO fine-tuning - doing it live is too computationally costly, so this runs on the mini split only.
+
+### Notebook `03` - `03_Training_of_all_our_models_GGN_GO_CAFA5_v3.ipynb`
+
+The training and evaluation notebook. Pulls every embedding tar from GCS, then uses `scripts/unified_cafa_model_trainer/` to:
+
+1. train small `ggn` / `mlp` heads on each embedding source - T5, GearNet, ESM-GearNet, GGN-GO (`train_mlp_clean_torch.py`), with `BCEWithLogitsLoss` and early stopping;
+2. run the AlphaFold-vs-experimental structure-swap test (`eval_experimental_vs_alphadb.py`);
+3. compute the naive class-frequency baseline (`eval_naive_freq_cafa.py`).
+
+All heads sit on top of frozen encoders (the backbones are never fine-tuned). Every result table in the notebook is backed by the cell output directly below it.
 
 ### `scripts/setup_env.sh`
 
@@ -88,12 +84,12 @@ Called from the notebook via:
 1. **Upload the notebooks** to Google Colab (`File → Upload notebook`).
 2. Set the runtime to **GPU** (`Runtime → Change runtime type → T4 GPU` or better).
 3. **Mount Google Drive** if you want to persist checkpoints between sessions (the environment detection cell handles this automatically when `IN_COLAB = True`).
-4. Run the environment setup cell in CNN notebook:
+4. Run the environment setup cell (only notebook 01, embedding extraction, needs TorchDrug):
    ```python
    !bash {SCRIPTS_DIR}/setup_env.sh
    ```
-   This will install micromamba and build the `torchdrug38` environment (~10–20 min on first run).
-5. In GGN_GO notebook, set `RUNTIME = "colab"` in the configuration cell, then run all cells in order.
+   This will install micromamba and build the `torchdrug38` environment (~10-20 min on first run).
+5. In each notebook's configuration cell set `RUNTIME = "colab"` (or `IN_COLAB = True`), then run notebooks `00 -> 01 -> 02 -> 03` in order.
 
 #### GCS credentials (Colab)
 The notebooks authenticate against the GCS bucket using a service account key. Store your own service account credentials in the `gcs_key.json` in the root folder, or set `USE_GCS = False` and supply the data files manually.
@@ -105,11 +101,11 @@ Download the required files from the [CAFA-5 Kaggle competition](https://www.kag
 - `go-basic.obo` (also available at `http://purl.obolibrary.org/obo/go/go-basic.obo`)
 - `IA.txt`
 
-AlphaFold structures are downloaded automatically in `demo` mode from the [AlphaFold database API](https://alphafold.ebi.ac.uk). For the full dataset (~120,000 proteins), use the GCS shards or pre-download all structures.
+AlphaFold structures are downloaded automatically in `demo` mode from the [AlphaFold database API](https://alphafold.ebi.ac.uk). For the full dataset (~142,000 proteins), use the GCS shards or pre-download all structures.
 
 ---
 
-### Option B: Local Linux Environment
+### Option B: Local Linux Environment (less recommended, untested because of CUDA)
 
 1. **Clone or copy** the notebooks and the `scripts/` directory to your working directory.
 2. **Run the environment setup script:**
@@ -122,12 +118,12 @@ AlphaFold structures are downloaded automatically in `demo` mode from the [Alpha
    export MAMBA_ROOT_PREFIX=/content/micromamba
    /content/bin/micromamba run -n torchdrug38 python your_script.py
    ```
-4. **Set `RUNTIME = "local"`** in the GGN_GO notebook configuration cell. This sets `BASE_DIR` to `./ggn_go_workspace` and `ROOT_DIR` to the current working directory instead of `/content`.
+4. **Set `RUNTIME = "local"`** in the notebook configuration cell. This sets `BASE_DIR` to `./ggn_go_workspace` and `ROOT_DIR` to the current working directory instead of `/content`.
 5. **Place data files** in the paths expected by each notebook (or adjust `ROOT_DIR` / `DATA_DIR` at the top of each notebook).
 
 #### Local pip-only environment (alternative)
 
-If you do not need TorchDrug / GearNet (i.e., you only want to run GGN_GO notebook), you can skip `setup_env.sh` and install directly:
+If you do not need TorchDrug / GearNet (i.e., you only want to run notebook `02` and/or `03`), you can skip `setup_env.sh` and install directly:
 
 ```bash
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
@@ -149,24 +145,23 @@ sudo apt-get install dssp
 
 | File | Source | Used in |
 |------|--------|---------|
-| `train_terms.tsv` | CAFA-5 Kaggle / GCS | Both notebooks |
-| `train_taxonomy.tsv` | CAFA-5 Kaggle / GCS | GNN otebook, GGN_GO notebook |
-| `go-basic.obo` | OBO Foundry / GCS | Both notebooks |
-| `IA.txt` | GCS (`gs://protein_shards/IA.txt`) | Both notebooks |
-| `shards/*.tar` | GCS (`gs://protein_shards/shards/`) | GNN otebook |
-| `ggngo_eval_pack.tar` | Produced by GNN notebook / GCS | GGN_GO notebook (`full` mode) |
-| `gearnet_embeds.zip` / `.tar` | Produced by GNN notebook / GCS | GGN_GO notebook (MLP training) |
-| `esm_gearnet_all_pdbs_embeds.tar` | Produced by GNN notebook / GCS | GGN_GO notebook (MLP training) |
-| `t5_prot_baseline_train_embeds.npy.zip` | GCS | GNN otebook, GGN_GO notebook (T5 baseline) |
-| `mc_gearnet_edge.pth` | [TorchDrug model zoo](https://torchdrug.ai) | GNN otebook (GearNet) |
-| `mc_esm_gearnet.pth` | [Zenodo 10034578](https://zenodo.org/records/10034578) | GNN otebook (ESM-GearNet) |
-| `GGN-GO/Model/model_bp/mf/cc.pt` | Cloned from [MiJia-ID/GGN-GO](https://github.com/MiJia-ID/GGN-GO) | GGN_GO notebook |
+| `train_terms.tsv` | CAFA-5 Kaggle / GCS | Notebooks 01, 03 (labels + eval) |
+| `train_taxonomy.tsv` | CAFA-5 Kaggle / GCS | Notebook 00 (accession list) |
+| `go-basic.obo` | OBO Foundry / GCS | Notebooks 02, 03 |
+| `IA.txt` | GCS (`gs://protein_shards/IA.txt`) | Notebook 03 (WFmax weights) |
+| `shards/*.tar` | GCS (`gs://protein_shards/`) | Produced by 00, consumed by 01 |
+| `gearnet_embeds.zip` / `.tar` | Produced by notebook 01 / GCS | Notebook 03 (head training) |
+| `esm_gearnet_all_pdbs_embeds.tar` | Produced by notebook 01 / GCS | Notebook 03 (head training) |
+| `t5_prot_baseline_train_embeds.npy.zip` | GCS | Notebook 03 (T5 baseline) |
+| `mc_gearnet_edge.pth` | [TorchDrug model zoo](https://torchdrug.ai) | Notebook 01 (GearNet) |
+| `mc_esm_gearnet.pth` | [Zenodo 10034578](https://zenodo.org/records/10034578) | Notebook 01 (ESM-GearNet) |
+| `GGN-GO/Model/model_bp/mf/cc.pt` | Cloned from [MiJia-ID/GGN-GO](https://github.com/MiJia-ID/GGN-GO) | Notebook 02 |
 
 ---
 
 ## Evaluation
 
-All models are evaluated using the CAFA competition metrics implemented in `cafa.py` (written inline in GGN_GO notebook):
+All models are evaluated using the CAFA competition metrics implemented in `scripts/unified_cafa_model_trainer/cafa.py`:
 
 - **Fmax** - the maximum F-score over all decision thresholds τ ∈ [0.01, 0.99], computed separately per ontology namespace and averaged.
 - **Weighted Fmax (WFmax)** - same as Fmax but GO term contributions are weighted by their Information Accretion (IA) values from `IA.txt`.

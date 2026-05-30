@@ -16,6 +16,9 @@ from cafa import (
     ia_parser,
 )
 
+# The prediction heads are defined once in the trainer and imported here
+from train_mlp_clean_torch import MLP, GGNHead
+
 
 def norm_id(x):
     return str(x).strip()
@@ -50,44 +53,6 @@ def aspect_to_task(aspect):
         "MFO": "mf",
         "CCO": "cc",
     }.get(aspect, None)
-
-
-class MLP(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.LayerNorm(input_dim),
-            nn.Linear(input_dim, 1024, bias=False),
-            nn.LayerNorm(1024),
-            nn.GELU(),
-            nn.Dropout(0.25),
-            nn.Linear(1024, 1024, bias=False),
-            nn.LayerNorm(1024),
-            nn.GELU(),
-            nn.Dropout(0.25),
-            nn.Linear(1024, 512, bias=False),
-            nn.LayerNorm(512),
-            nn.GELU(),
-            nn.Dropout(0.20),
-            nn.Linear(512, output_dim),
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class GGNHead(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 1024),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(1024, output_dim),
-        )
-
-    def forward(self, x):
-        return self.net(x)
 
 
 def load_train_terms(path):

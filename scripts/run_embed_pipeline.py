@@ -2,7 +2,7 @@
 
 This is equivalent to:
     PYTHONPATH=scripts python -m unified_embedding_extractor ...
-but you can just point at this file:
+also can just point at this file:
     python scripts/run_embed_pipeline.py --mode all --encoder gearnet ...
 """
 

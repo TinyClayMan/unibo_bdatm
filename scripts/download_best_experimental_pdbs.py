@@ -6,7 +6,7 @@ For each accession we:
     1. Hit the UniProt REST API and pull out its PDB cross-references.
     2. Filter by resolution (X-ray, cryo-EM) and optionally NMR.
     3. Pick one hit using method preference, resolution, and chain coverage.
-    4. Download the chosen structure from RCSB (PDB, then CIF as fallback).
+    4. Download the chosen structure from RCSB (PDB).
 
 Outputs (per split):
     <split>/structures/<PDB_ID>.pdb               raw downloads
